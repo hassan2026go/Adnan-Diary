@@ -1,0 +1,130 @@
+rules_version = '2';
+service cloud.firestore {
+  function U(db, uid) { return /databases/$(db)/documents/users/$(uid); }
+  function validDay(d) {
+    return d.keys().hasOnly(['t','p','k','o','by','at'])
+      && (!d.keys().hasAny(['t']) || d.t in ['w','x','h','s','a'])
+      && d.get('p', []) is list && d.get('p', []).size() <= 20
+      && d.get('k', []) is list && d.get('k', []).size() <= 20
+      && (!d.keys().hasAny(['o']) || (d.o is number && d.o >= 0 && d.o <= 24));
+  }
+  match /databases/{database}/documents {
+
+    function isAdmin() {
+      return request.auth != null && exists(U(database, request.auth.uid))
+        && get(U(database, request.auth.uid)).data.role == 'admin';
+    }
+    function isMyWorker(wid) {
+      return isAdmin() && exists(U(database, wid))
+        && get(U(database, wid)).data.adminId == request.auth.uid;
+    }
+    function canAccess(wid) {
+      return request.auth != null && (request.auth.uid == wid || isMyWorker(wid));
+    }
+    function verified() { return request.auth.token.email_verified == true; }
+    function validJoin(d) {
+      return d.keys().hasAll(['adminId','joinCode'])
+        && exists(/databases/$(database)/documents/codes/$(d.joinCode))
+        && get(/databases/$(database)/documents/codes/$(d.joinCode)).data.adminId == d.adminId;
+    }
+    function validWage(d) {
+      return d.wage is number && d.wage >= 0 && d.cur is string && d.cur.size() <= 6
+        && d.get('site','') is string && d.get('site','').size() <= 30;
+    }
+
+    match /users/{uid} {
+      allow get: if canAccess(uid);
+      allow list: if isAdmin() && resource.data.adminId == request.auth.uid;
+      // إنشاء الحساب: مدير أو عامل (والعامل بكود مدير اختياري)
+      allow create: if request.auth != null && request.auth.uid == uid && verified()
+        && request.resource.data.keys().hasOnly(['role','name','phone','photo','email','adminId','joinCode'])
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.get('photo','').size() < 20000
+        && (
+          (request.resource.data.role == 'admin'
+            && !request.resource.data.keys().hasAny(['adminId','joinCode']))
+          || (request.resource.data.role == 'worker'
+            && (!request.resource.data.keys().hasAny(['adminId','joinCode'])
+                || validJoin(request.resource.data)))
+        );
+      // المستخدم يعدّل اسمه وهاتفه وصورته
+      allow update: if request.auth != null && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','phone','photo'])
+        && request.resource.data.get('photo','').size() < 20000;
+      // العامل المنفرد (بلا مدير) يحدد أجره بنفسه
+      allow update: if request.auth != null && request.auth.uid == uid
+        && resource.data.role == 'worker'
+        && !resource.data.keys().hasAny(['adminId'])
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['wage','cur','site'])
+        && validWage(request.resource.data);
+      // العامل ينضم لمدير لاحقاً بكود صحيح
+      allow update: if request.auth != null && request.auth.uid == uid
+        && resource.data.role == 'worker'
+        && !resource.data.keys().hasAny(['adminId'])
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['adminId','joinCode'])
+        && validJoin(request.resource.data);
+      // حذف الحساب: صاحبه فقط
+      allow delete: if request.auth != null && request.auth.uid == uid;
+      // المدير يحدد أجر وعملة وموقع عماله
+      allow update: if isMyWorker(uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','phone','wage','cur','site'])
+        && (!request.resource.data.keys().hasAny(['wage']) || validWage(request.resource.data));
+    }
+
+    // دفتر الديون: خاص بصاحبه فقط
+    match /users/{uid}/debts/{id} {
+      allow read, delete: if request.auth != null && request.auth.uid == uid;
+      allow create, update: if request.auth != null && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['who','a','dir','note','d','paid'])
+        && request.resource.data.who is string && request.resource.data.who.size() <= 60
+        && request.resource.data.a is number
+        && request.resource.data.dir in ['in','out']
+        && request.resource.data.note.size() <= 200;
+    }
+
+    // أكواد انضمام العمال
+    match /codes/{code} {
+      allow get: if request.auth != null;
+      allow list: if isAdmin() && resource.data.adminId == request.auth.uid;
+      allow create: if isAdmin() && request.resource.data.keys().hasOnly(['adminId'])
+        && request.resource.data.adminId == request.auth.uid;
+      allow delete: if isAdmin() && resource.data.adminId == request.auth.uid;
+    }
+
+    match /workers/{wid}/days/{day} {
+      allow read, delete: if canAccess(wid);
+      allow create, update: if canAccess(wid) && validDay(request.resource.data);
+    }
+    match /workers/{wid}/notes/{id} {
+      allow read: if canAccess(wid);
+      allow create: if request.auth != null && request.auth.uid == wid
+        && request.resource.data.keys().hasOnly(['x','d'])
+        && request.resource.data.x is string && request.resource.data.x.size() <= 500;
+      allow delete: if request.auth != null && request.auth.uid == wid;
+    }
+    // اعتماد الكشف الأسبوعي: المدير يعتمد، والعامل يوافق
+    match /workers/{wid}/approvals/{wk} {
+      allow read: if canAccess(wid);
+      allow create: if isMyWorker(wid)
+        && request.resource.data.keys().hasOnly(['m','s'])
+        && request.resource.data.m is number;
+      allow update: if (isMyWorker(wid)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['m','s']))
+        || (request.auth != null && request.auth.uid == wid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['w'])
+          && request.resource.data.w is number);
+      // لا يُحذف إلا بعد حذف الحساب نفسه
+      allow delete: if request.auth != null && request.auth.uid == wid && !exists(U(database, wid));
+    }
+    // سجل التعديلات: إضافة فقط، ولا يُعدَّل ولا يُحذف
+    match /workers/{wid}/log/{id} {
+      allow read: if canAccess(wid);
+      allow create: if canAccess(wid)
+        && request.resource.data.keys().hasOnly(['d','a','at','n','u'])
+        && request.resource.data.u == request.auth.uid
+        && request.resource.data.a is string && request.resource.data.a.size() <= 200;
+      // لا يُحذف إلا بعد حذف الحساب نفسه (يبقى السجل محمياً أثناء العمل)
+      allow delete: if request.auth != null && request.auth.uid == wid && !exists(U(database, wid));
+    }
+  }
+}
